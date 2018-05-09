@@ -1,0 +1,1013 @@
+---
+title: "MTA Ridership and Delays over Time vs. Recent Media Coverage of the MTA"
+author: "Heather Geiger"
+date: "May 9, 2018"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+# Introduction
+
+Ask a New Yorker how their commute has been going, and they will often complain that it feels like the subway has been getting worse in recent times. Media reports confirm this idea. For example, this Gothamist article states that monthly delays more than doubled from 2012 to 2017 (http://gothamist.com/2017/02/13/subway_delays_mta_cuomo.php).
+
+At the same time, we all need to get around. Even with fare increases, a $2.75 subway ride is a lot cheaper than taking a cab. The MTA reports that average weekday subway ridership increased steadily every year from 2012-2016 (http://web.mta.info/nyct/facts/ridership/#atGlance_s). Average weekend subway ridership either increased or remained relatively constant.
+
+This report will explore the details of changes in ridership and the frequency of performance issues over time.
+
+It will also explore the tone of media reports about the MTA in recent months.
+
+One major question to be answered is how changes in ridership relate to quality of service? In other words, do New Yorkers exhibit some elasticity of demand in response to delays? Or is demand mostly inelastic?
+
+Another question will be to quantify the tone of media reports about the MTA, and compare to performance data to see if the tone matches the data.
+
+Unfortunately, comprehensive news data using the Google News API to search by keyword limits the search space to the past three months. So we cannot compare how the tone of media reports about the MTA may have changed over time correlating with changes in performance. 
+
+One could use web scraping to extract media reports across a broader time span, but that is beyond the scope of this report. However, this represents an interesting possibility for future research.
+
+Data sources for this report will include:
+
+1. A CSV file with weekly ridership data broken down by station from 2010 to 2018.
+2. A CSV file with monthly rates of delays broken down by subway line, from 2009 to 2017.
+3. Google News API results searching for "MTA" from select news sources (Gothamist, NY Daily News, NY Post, etc.) from the past three months (roughly February-April 2018)
+
+Since the weekly ridership data is by individual station rather than subway line, this report will also source complementary data from the MTA to match up subway lines to each station.
+
+By matching up by subway line, one can correlate delays and ridership data in a more specific way than just looking at general trends across the whole system.
+
+As for the news data, the hypothesis here is that media reports about the MTA in recent times will be mostly negative.
+
+# Libraries
+
+Libraries used for this analysis include:
+
+1. Tidyverse (tidyr, dplyr, ggplot2, stringr)
+2. RCurl (to download information from URLs)
+3. jsonlite (to process JSON files from the Google News API)
+4. lubridate (to process date information)
+5. XML (to access data from HTML pages by HTML tag and class)
+6. indicoio (sentiment analysis)
+
+```{r load-libraries, echo=TRUE, eval=TRUE, results='hide', message=FALSE, warning=FALSE}
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(jsonlite)
+library(lubridate)
+library(RCurl)
+library(XML)
+library(indicoio)
+```
+
+# Sources
+
+### MTA ridership
+
+#### About the data
+
+The CSV file used in this report is available here:
+
+https://raw.githubusercontent.com/JeremyOBrien16/NYC-MTA-Weekly-MetroCard-Swipes/master/Fare_Card_History_for_Metropolitan_Transportation_Authority__MTA___Beginning_2010.csv
+
+The CSV is a wide dataset, where each row represents one week at a particular station. The columns represent the number of different types of fares, including full fare (a regular ride), weekly or monthly fares (someone swiping a weekly or monthly Metrocard), senior or disabled reduced-price fares, etc.
+
+Here, we will start from a version of this dataset that is already somewhat tidied. One can find the details of the tidying here:
+
+https://rpubs.com/hmgeiger/368699
+
+Tidying included converting from wide to long format, so that each row would represent one week at a particular station for one particular fare type. 
+
+Also ran some simple cleaning, like collapsing cases where the same station was listed under two different names ("PROSPECT AVE-4TH AVE" and "PROSPECT AVENUE-4TH AVENUE").
+
+The tidied data set is available as an R object (called "mta") in Github here:
+
+https://github.com/heathergeiger/Data607_project2/blob/master/mta_by_station_tidied.Rdata
+
+#### Sum ridership across fare types.
+
+After downloading the R object (done outside of R), we are just going to do a bit of additional tidying.
+
+For this analysis, we are mainly interested in fares as a proxy for ridership, and do not care so much about the types of fares.
+
+So we are going to simply sum up the Num.fares column for each combination of date and station.
+
+This should reduce the number of rows substantially, making the data a bit easier to work with.
+
+```{r sum-mta-across-fare-types, echo=TRUE, eval=TRUE, cache=TRUE}
+load("mta_by_station_tidied.Rdata")
+
+total_weekly_ridership <- mta %>% group_by(From.Date,Remote.Station.ID,Station) %>% summarize(Total.ridership = sum(Num.fares))
+total_weekly_ridership <- data.frame(total_weekly_ridership,stringsAsFactors=FALSE)
+```
+
+#### Match up the subway lines per station.
+
+Now, let's match up the station names to what subway lines run there.
+
+First, let's download an Excel file with the station names and train lines per station.
+
+```{r download-lines-per-station, echo=TRUE, eval=FALSE}
+download.file("http://web.mta.info/developers/resources/nyct/turnstile/Remote-Booth-Station.xls",destfile="Remote-Booth-Station.xls")
+```
+
+Outside of R, open Excel and save the file as a CSV called "Remote-Booth-Station.csv". Then, we can use the "remote station ID" in both data sets to integrate them.
+
+```{r match-stations-with-lines, echo=TRUE, eval=TRUE, cache=TRUE}
+stations <- read.csv("Remote-Booth-Station.csv",header=TRUE,stringsAsFactors=FALSE)
+
+total_weekly_ridership_remote_ids <- unique(total_weekly_ridership$Remote.Station.ID)
+
+#A few of the remote station IDs are actually two or three IDs collapsed with a slash ("/") in between. Take the first occurence of the station ID in these cases.
+
+total_weekly_ridership_remote_ids <- unique(unlist(lapply(strsplit(total_weekly_ridership_remote_ids,"/"),"[[",1)))
+
+total_weekly_ridership$Remote.Station.ID <- plyr::mapvalues(total_weekly_ridership$Remote.Station.ID,
+	from=unique(total_weekly_ridership$Remote.Station.ID),
+	to=total_weekly_ridership_remote_ids)
+
+#The only stations not in "stations" are very new stations like for the 2nd Avenue subway. Add these to the data frame, after filtering down to just columns of interest.
+
+stations <- stations %>% select(c("Remote","Station","Line.Name"))
+stations <- rbind(stations,data.frame(Remote = c("R072","R570","R571","R572"),
+Station = c("34TH STREET - HUDSON YARDS","72ND STREET - 2 AVENUE","86TH STREET - 2 AVENUE","96TH STREET - 2 AVENUE"),
+Line.Name = c("7","Q","Q","Q"),
+stringsAsFactors=FALSE))
+
+#Merge the two data frames by remote station ID.
+
+colnames(stations)[1] <- "Remote.Station.ID"
+
+total_weekly_ridership <- merge(total_weekly_ridership,stations[,c("Remote.Station.ID","Line.Name")],by="Remote.Station.ID",all=TRUE)
+```
+
+#### Summarize ridership per station by year.
+
+Let's further pare down the data, summarizing weekly ridership per station as a mean per year instead of including information for every week.
+
+```{r mean-ridership-per-station-per-year, echo=TRUE, eval=TRUE, cache=TRUE}
+mean_weekly_ridership_per_year <- total_weekly_ridership %>% group_by(year(From.Date),Remote.Station.ID,Station,Line.Name) %>% summarize(Mean.weekly.ridership = mean(Total.ridership,na.rm=TRUE))
+mean_weekly_ridership_per_year <- data.frame(mean_weekly_ridership_per_year,stringsAsFactors=FALSE)
+
+colnames(mean_weekly_ridership_per_year)[1] <- "Year"
+
+mean_weekly_ridership_per_year <- data.frame(mean_weekly_ridership_per_year,Num.lines = str_length(mean_weekly_ridership_per_year$Line.Name),stringsAsFactors=FALSE)
+```
+
+#### Separate stations to be counted for individual lines from "hubs" with many lines.
+
+You will notice that the ridership data is by station, and does not distinguish lines within the same station.
+
+In most stations, one can swipe in at a turnstile closer to one train, and then walk through the station to take a different train instead. So these cannot be disentangled just by turnstile swipes.
+
+In some cases (like if similar lines like the A/C/E are the only ones sharing a station), it seems reasonable to allow a bit of double-counting and count the station's riders for each line.
+
+However we probably don't want to assume that all riders at Times Square are taking the R train, for example.
+
+Looking at the lines per station, three trains per station seems like a reasonable cutoff where we can count riders at the station separately for each line.
+
+For stations with 4+ train lines, designate them as a separate category called "Hub".
+
+```{r indiv-lines-vs-hubs, echo=TRUE, eval=TRUE, cache=TRUE}
+#Make a longer version of mean_weekly_ridership_per_year, where we print the line again for each train that goes to the station if the station has 3 or fewer lines.
+#Store this information in column "Line".
+
+mean_weekly_ridership_per_year_long <- mean_weekly_ridership_per_year
+mean_weekly_ridership_per_year_long <- mean_weekly_ridership_per_year_long[mean_weekly_ridership_per_year_long$Num.lines <= 3,]
+
+mean_weekly_ridership_per_year_long <- data.frame(Year = rep(mean_weekly_ridership_per_year_long$Year,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Remote.Station.ID = rep(mean_weekly_ridership_per_year_long$Remote.Station.ID,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Station = rep(mean_weekly_ridership_per_year_long$Station,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Line.Name = rep(mean_weekly_ridership_per_year_long$Line.Name,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Mean.weekly.ridership = rep(mean_weekly_ridership_per_year_long$Mean.weekly.ridership,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Num.lines = rep(mean_weekly_ridership_per_year_long$Num.lines,times=mean_weekly_ridership_per_year_long$Num.lines),
+        Line = unlist(strsplit(mean_weekly_ridership_per_year_long$Line.Name,"")),
+        stringsAsFactors=FALSE)
+
+mean_weekly_ridership_per_year_long <- rbind(mean_weekly_ridership_per_year_long,
+        data.frame(mean_weekly_ridership_per_year[mean_weekly_ridership_per_year$Num.lines > 3,],
+        Line = "Hub",
+        stringsAsFactors=FALSE))
+```
+
+### MTA performance
+
+#### About this data
+
+Performance data may be downloaded here:
+
+http://web.mta.info/persdashboard/perxml/MTA_Performance_Datall.zip
+
+After downloading, data will be under MTA_Performance_Datall/Performance_NYCT.csv in the folder where you download.
+
+This data is actually already in long format. There is one row per month per metric for the metrics we are interested in.
+
+We are interested in metrics "Subway Wait Assessment" and "OTP (Terminal)".
+
+Definition for "Subway Wait Assessment" (source http://web.mta.info/developers/Performance_Indicators_by%20Agency.xls):
+
+The percent of actual intervals between trains that are no more than the scheduled interval plus 2 minutes during peak hours (6 AM - 9 AM and 4 PM - 7 PM) and plus 4 minutes during off-peak hours (9 AM - 4 PM and 7 PM - midnight). Wait assessment is measured weekdays between 6:00 AM and midnight when service is relatively frequent. The data is based on a sample methodology. The monthly sample size is not statistically significant and, therefore, the agency only reports a 12-month rolling average in the YTD column.
+
+Definition of "OTP (Terminal)":
+
+The percent of trains making all the scheduled station stops arriving at the destination terminal on-time, early or no more than five minutes late. Trains re-routed, abandoned or operating under temporary schedule changes are all counted as late. This is a new indicator that New York City Transit began reporting in August 2008.
+
+#### Processing performance data and integrating with ridership data by train line
+
+For the integrated analysis, we will focus on individual train lines, and we will also remove shuttle lines that only go a few stops (like the 42nd Street Shuttle).
+
+Once we do this, we may match up the ridership data with the performance data by train line. We have performance data matched up one-to-one for nearly all train lines in our ridership data set. The only special case is performance for the J/Z line, which is collapsed into one set of metrics.
+
+We will also use the mean of the monthly performance per year for both of our metrics of interest, so that the performance data is on the same time scale as the ridership data.
+
+```{r integrate-ridership-and-performance, echo=TRUE, eval=TRUE, cache=TRUE}
+#Read in performance data.
+
+performance <- read.csv("MTA_Performance_Datall/Performance_NYCT.csv",header=TRUE,stringsAsFactors=FALSE)
+
+#Remove hubs and shuttles from mean_weekly_ridership_per_year_long, then use the line names to get the indicator names to use from performance data.
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles <- mean_weekly_ridership_per_year_long[mean_weekly_ridership_per_year_long$Line != "S" & mean_weekly_ridership_per_year_long$Line != "Hub",]
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names <- unique(mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Line) 
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_OTP_indicator_names <- ifelse(mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names == "J" | mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names == "Z",
+	"OTP (Terminal) - J Z Line",
+	paste0("OTP (Terminal) - ",mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names," Line"))
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_wait_indicator_names <- ifelse(mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names == "J" | mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names == "Z",
+	"Subway Wait Assessment - J Z Line",
+	paste0("Subway Wait Assessment - ",mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names," Line"))
+
+#Get mean performance data per line per year.
+
+OTP_per_line_per_year <- performance[performance$INDICATOR_NAME %in% mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_OTP_indicator_names,] %>% 
+	select(c("INDICATOR_NAME","PERIOD_YEAR","MONTHLY_ACTUAL")) %>% 
+	group_by(INDICATOR_NAME,PERIOD_YEAR) %>% 
+	summarize(Mean.monthly.actual.performance = mean(MONTHLY_ACTUAL,na.rm=TRUE))
+OTP_per_line_per_year <- data.frame(OTP_per_line_per_year,stringsAsFactors=FALSE)
+
+wait_per_line_per_year <- performance[performance$INDICATOR_NAME %in% mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_wait_indicator_names,] %>% 
+	select(c("INDICATOR_NAME","PERIOD_YEAR","MONTHLY_ACTUAL")) %>% 
+	group_by(INDICATOR_NAME,PERIOD_YEAR) %>% 
+	summarize(Mean.monthly.actual.performance = mean(MONTHLY_ACTUAL,na.rm=TRUE))
+wait_per_line_per_year <- data.frame(wait_per_line_per_year,stringsAsFactors=FALSE)
+
+#Add line names to performance data.
+
+OTP_indicators_per_line <- data.frame(Line = mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names,
+        INDICATOR_NAME = mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_OTP_indicator_names,
+        stringsAsFactors=FALSE)
+
+wait_indicators_per_line <- data.frame(Line = mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_names,
+        INDICATOR_NAME = mean_weekly_ridership_per_year_minus_hubs_and_shuttles_line_wait_indicator_names,
+        stringsAsFactors=FALSE)
+
+OTP_per_line_per_year <- merge(OTP_per_line_per_year,OTP_indicators_per_line,by="INDICATOR_NAME",all=TRUE)
+wait_per_line_per_year <- merge(wait_per_line_per_year,wait_indicators_per_line,by="INDICATOR_NAME",all=TRUE)
+
+#Combine OTP_per_line_per_year and wait_per_line_per_year into one data frame with performance data as two separate columns "OTP" and "Wait".
+
+colnames(OTP_per_line_per_year)[3] <- "OTP"
+colnames(wait_per_line_per_year)[3] <- "Wait"
+
+OTP_and_wait_per_line_per_year <- merge(OTP_per_line_per_year[,2:4],wait_per_line_per_year[,2:4],by=c("PERIOD_YEAR","Line"),all=TRUE)
+
+colnames(OTP_and_wait_per_line_per_year)[1] <- "Year"
+
+#Let's remove 2009 from OTP_and_wait_per_line_per_year, as we do not have ridership data for this year.
+#Then, combine with mean_weekly_ridership_per_year_minus_hubs_and_shuttles.
+
+OTP_and_wait_per_line_per_year <- OTP_and_wait_per_line_per_year[OTP_and_wait_per_line_per_year$Year != 2009,]
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles <- merge(mean_weekly_ridership_per_year_minus_hubs_and_shuttles,OTP_and_wait_per_line_per_year,by=c("Year","Line"),all=TRUE)
+
+#We are now ready to proceed with integrated analysis using mean_weekly_ridership_per_year_minus_hubs_and_shuttles.
+```
+
+```{r save-integrated-ridership-and-performance, echo=FALSE, eval=TRUE}
+save(mean_weekly_ridership_per_year_minus_hubs_and_shuttles,file="mean_weekly_ridership_per_year_minus_hubs_and_shuttles_created_with_cleaner_code.Rdata")
+```
+
+### News coverage of the MTA from Google News API
+
+#### Querying the API
+
+First, read in my API key, which I keep in a different folder from this script on my computer.
+
+If running this script yourself, instead assign api_key to your own API key as a string.
+
+After this, ready to query API.
+
+I initially tried to query the API without giving a list of domains to "domains" when querying the API. But even trying to use keywords other than "MTA" (like adding "transit" or "subway"), this resulted in a lot of extra results that were not of interest.
+
+So we limit to a set of websites known for their New York City news coverage.
+
+However, we choose a broad range of sources to minimize bias caused by focusing too much on one source or type of source.
+
+First, we include classic national news sources based in New York (New York Times and Wall Street Journal). We also include local news papers (e.g. NY Post, NY Daily News, AM NY), as well as the local affiliates of national news stations (NBC, ABC). Finally, we include online-only publications that focus on New York (e.g. Curbed, Gothamist).
+
+For the date range, we limit the search space to span from February 4, 2018 to May 4, 2018. We will run this query only once, then save the object so that can access the results in the future without needing to query the API again.
+
+```{r query-api, echo=TRUE, eval=FALSE}
+api_key <- readLines("/Users/hmgeiger/Documents/google_news_api_key.txt")
+
+my_date_start <- "2018-02-04"
+my_date_end <- "2018-05-04"
+
+domains_to_search <- c("gothamist.com","nypost.com","nydailynews.com","curbed.com","timeout.com","wnyc.org","observer.com","wsj.com","amny.com","nytimes.com","nbcnewyork.com","abc7ny.com","villagevoice.com")
+
+query_string <- paste0("https://newsapi.org/v2/everything?q=MTA&from=",my_date_start,"&to=",my_date_end,"&sortBy=relevancy&pageSize=100&apiKey=",api_key)
+query_string <- paste0(query_string,"&domains=",paste0(domains_to_search,collapse=","))
+
+initialQuery <- fromJSON(query_string)
+num_results = initialQuery$totalResults
+if(num_results %% 100 == 0){maxPages = num_results / 100}
+if(num_results %% 100 > 1){maxPages = trunc(num_results/100) + 1}
+
+search_results_all_pages <- vector("list",length=maxPages)
+
+for(i in 1:maxPages)
+{
+this_page <- fromJSON(paste0(query_string,"&page=",i))
+search_results_all_pages[[i]] <- this_page$articles
+Sys.sleep(5)
+}
+
+search_results_all_pages <- rbind_pages(search_results_all_pages)
+
+save(search_results_all_pages,file="google_news_api_results_mta_02.04.18_to_05.04.18.Rdata")
+```
+
+```{r load-api-query-results, echo=FALSE, eval=TRUE}
+load("google_news_api_results_mta_02.04.18_to_05.04.18.Rdata")
+```
+
+#### Extracting article text
+
+Looking through the API results, it was apparent that even further filtering of sources would be necessary.
+
+For example, the API returned a number of results from The Wall Street Journal, but I realized after including this source that the articles I wanted were mostly behind a paywall.
+
+Some sources were also removed if the article text was not readily available by web scraping, or if there were very few articles found from that source.
+
+After filtering by source, I manually went to an example article from each source and determined the HTML tags and class needed to extract article text.
+
+Then for each URL, I downloaded the article HTML, then used the HTML tags and class for the appropriate source to extract article text.
+
+The scraping of article URLs, like the API call, should be run only once and results saved to minimize the load on the source web pages.
+
+```{r filter-sources, echo=TRUE, eval=TRUE}
+mta_news_article_info <- data.frame(source = search_results_all_pages$source$name,search_results_all_pages[,setdiff(colnames(search_results_all_pages),"source")],stringsAsFactors=FALSE)
+
+frequency_per_source <- data.frame(table(mta_news_article_info$source))
+frequency_per_source$Var1 <- as.vector(frequency_per_source$Var1)
+
+#Let's choose sources that have at least 5 articles, and also exclude "The Wall Street Journal" and "Wnyc.org".
+
+sources_to_choose <- setdiff(frequency_per_source$Var1[frequency_per_source$Freq >= 5],c("Wnyc.org","The Wall Street Journal"))
+
+#Get HTML tag and class per source.
+
+HTML_tags_per_source <- data.frame(source = sources_to_choose,
+	tag = c("div","div","div","script","div","div","div"),
+	name=c("class","class","class","data-schema","class","class","class"),
+	subtype = c("body-text","c-entry-content","entry-body","NewsArticle","entry-content entry-content-read-more","entry-content","post"),
+	stringsAsFactors=FALSE)
+
+HTML_tags_per_source <- data.frame(HTML_tags_per_source,
+	xpath.text = paste0("//",HTML_tags_per_source$tag,"[@",HTML_tags_per_source$name," = '",HTML_tags_per_source$subtype,"']"),
+	stringsAsFactors=FALSE)
+
+#Filter mta_news_article_info by source, including remove the San Francisco version of Curbed.
+
+mta_news_article_info <- mta_news_article_info[mta_news_article_info$source %in% sources_to_choose,]
+mta_news_article_info <- mta_news_article_info[grep('sf.curbed',mta_news_article_info$url,invert=TRUE),]
+
+#Merge with Xpath text per source.
+
+mta_news_article_info <- merge(mta_news_article_info,HTML_tags_per_source[,c("source","xpath.text")],by="source",all=TRUE)
+```
+
+```{r text-per-article, echo=TRUE, eval=FALSE}
+curl <- getCurlHandle()
+curlSetOpt(cookiejar="cookies.txt", followlocation = TRUE, curl=curl)
+
+plain_text_all_articles <- vector("list",length=nrow(mta_news_article_info))
+
+for(i in 1:nrow(mta_news_article_info))
+{
+myurl <- mta_news_article_info$url[i]
+my_article <- getURL(myurl,curl = curl, verbose = FALSE)
+article_html_parsed <- htmlTreeParse(my_article,asText=TRUE, useInternalNodes = TRUE, encoding = 'UTF-8')
+plain_text <- xpathSApply(xmlRoot(article_html_parsed),mta_news_article_info$xpath.text[i],xmlValue)
+plain_text_all_articles[[i]] <- plain_text
+}
+
+save(plain_text_all_articles,file="mta_plain_text_all_articles_using_initialized_list.Rdata")
+```
+
+```{r load-text-per-article, echo=FALSE, eval=TRUE}
+load("mta_plain_text_all_articles_using_initialized_list.Rdata")
+```
+
+One of the articles we tried does not give any text using this method, and displays a "page not found" error in a browser.
+
+We should remove this article from the API results data frame as well as from our vector of scraped text.
+
+We also run some additional manual cleaning using string processing for certain articles that still contain extraneous text, or that contain special characters that we'd like to convert to normal characters.
+
+```{r clean-text-per-article, echo=TRUE, eval=TRUE}
+text_found_per_article <-  unlist(lapply(plain_text_all_articles,function(x)length(x)))
+
+mta_news_article_info <- mta_news_article_info[text_found_per_article == 1,]
+
+plain_text_all_articles <- plain_text_all_articles[which(text_found_per_article == 1)]
+
+plain_text_all_articles <- unlist(plain_text_all_articles)
+
+#Function to convert special HTML-specific characters to normal characters.
+#Source: https://stackoverflow.com/questions/5060076/convert-html-character-entity-encoding-in-r
+
+html2txt <- function(str) {
+      xpathApply(htmlParse(str, asText=TRUE),
+                 "//body//text()", 
+                 xmlValue)[[1]] 
+}
+
+for(i in 1:length(plain_text_all_articles))
+{
+plain_text_all_articles[i] <- html2txt(plain_text_all_articles[i])
+}
+
+#Clean up that one Gothamist article that had a lot of extraneous text related to a photo gallery, by starting it at the actual starting text seen in a web browser.
+
+gothamist_article_with_leading_photo_refs <- plain_text_all_articles[which(mta_news_article_info$source == "Gothamist.com")[1]]
+
+gothamist_article_with_leading_photo_refs_corrected <- unlist(strsplit(unlist(gothamist_article_with_leading_photo_refs),"On any normal weekday"))
+gothamist_article_with_leading_photo_refs_corrected <- paste0("On any normal weekday",gothamist_article_with_leading_photo_refs_corrected[2])
+
+plain_text_all_articles[which(mta_news_article_info$source == "Gothamist.com")[1]] <- gothamist_article_with_leading_photo_refs_corrected
+
+#Clean up all Daily News article text to get just the text specified in "articleBody" field.
+
+for(i in grep('daily',mta_news_article_info$source,ignore.case=TRUE))
+{
+dailynews_article <- plain_text_all_articles[i]
+dailynews_article_corrected <- unlist(strsplit(dailynews_article,"articleBody"))
+dailynews_article_corrected <- dailynews_article_corrected[2]
+dailynews_article_corrected <- strsplit(dailynews_article_corrected,'\\\"\\:')[[1]][2]
+plain_text_all_articles[i] <- dailynews_article_corrected
+}
+```
+
+```{r save-news-and-text-dfs, echo=FALSE, eval=TRUE}
+save(list=c("mta_news_article_info","plain_text_all_articles"),
+file="mta_news_article_info_and_plain_text_all_articles_created_with_cleaner_code.Rdata")
+```
+
+#### Sentiment analysis of extracted article text
+
+We will use Indico sentiment analysis to determine whether articles about the MTA are more often positive or negative.
+
+Indico is also an API. So again I will read in my key from my computer, but you should replace the API key variable with your own key.
+
+Save results after running so only need to run once.
+
+```{r sentiment-analysis, echo=TRUE, eval=FALSE}
+my_indicoio_API_Key <- readLines("/Users/hmgeiger/Documents/indico_api_key.txt")
+
+sentiments_per_article <- rep(NA,times=length(plain_text_all_articles))
+
+for(i in 1:length(plain_text_all_articles))
+{
+sentiments_per_article[i] <- unlist(sentiment_hq(plain_text_all_articles[i],api_key = my_indicoio_API_Key))
+}
+
+save(sentiments_per_article,file="sentiments_per_article.Rdata")
+```
+
+```{r sentiment-load, echo=FALSE, eval=TRUE}
+load("sentiments_per_article.Rdata")
+```
+
+#### Emotion analysis of extracted article text
+
+As a complement to the sentiment scores, we will also analyze each piece of text for the emotion expressed by the author.
+
+```{r emotion-analysis, echo=TRUE, eval=FALSE}
+my_indicoio_API_Key <- readLines("/Users/hmgeiger/Documents/indico_api_key.txt")
+
+emotions_per_article <- vector("list",length=length(plain_text_all_articles))
+
+for(i in 1:length(plain_text_all_articles))
+{
+emotions_per_article[[i]] <- unlist(emotion(plain_text_all_articles[i],api_key = my_indicoio_API_Key))
+}
+
+save(emotions_per_article,file="emotions_per_article.Rdata")
+
+emotions_per_article <- data.frame(Article.num = rep(1:length(plain_text_all_articles),each=5),
+	Emotion = rep(c("anger","joy","sadness","fear","surprise"),times=length(plain_text_all_articles)),
+	Probability = as.vector(unlist(emotions_per_article)),
+	Sentiment.score.article = rep(sentiments_per_article,each=5),
+	stringsAsFactors=FALSE)
+```
+
+```{r emotion-analysis-load, echo=FALSE, eval=TRUE}
+load("emotions_per_article.Rdata")
+
+emotions_per_article <- data.frame(Article.num = rep(1:length(plain_text_all_articles),each=5),
+        Emotion = rep(c("anger","joy","sadness","fear","surprise"),times=length(plain_text_all_articles)),
+        Probability = as.vector(unlist(emotions_per_article)),
+        Sentiment.score.article = rep(sentiments_per_article,each=5),
+        stringsAsFactors=FALSE)
+```
+
+#Analysis
+
+### Ridership trends by line and over time
+
+Let's start with a simple boxplot of ridership by line. We'll just do 2017 for now.
+
+Jitter the outliers a bit so we can identify them more clearly.
+
+```{r boxplot-ridership-by-line, echo=TRUE, eval=TRUE, fig.height = 7,fig.width = 7}
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[!(duplicated(paste0(mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Line,"/",mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Station,"/",mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year))),]
+
+#Looks like Penn Station got listed as two separate stations for the 1/2/3 vs. A/C/E. Let's remove these.
+#Also remove Jay Street from R train, which should be a "hub" station.
+
+mean_weekly_ridership_per_year_minus_hubs_and_shuttles <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Station != "34TH STREET & 7TH AVENUE" & mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Station != "34TH STREET & 8TH AVENUE" & mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Station != "JAY ST-METROTECH",]
+
+#Get just ridership for 2017. Then, set up data frame to label outliers.
+
+ridership_2017 <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year == 2017,]
+
+ridership_2017 <- ridership_2017[which(is.na(ridership_2017$Line) == FALSE),]
+
+#Code from here: https://stackoverflow.com/questions/33524669/labeling-outliers-of-boxplots-in-r
+
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+rownames(ridership_2017) <- paste0(as.character(as.vector(ridership_2017$Line)),"/",as.character(as.vector(ridership_2017$Line.Name)),"/",round(ridership_2017$Mean.weekly.ridership/1000,digits=1),"k")
+
+ridership_2017_to_plot <- ridership_2017 %>%
+ tibble::rownames_to_column(var="outlier") %>%
+ group_by(Line) %>%
+ mutate(is_outlier = ifelse(is_outlier(Mean.weekly.ridership),Mean.weekly.ridership,as.numeric(NA)))
+
+ridership_2017_to_plot$outlier[which(is.na(ridership_2017_to_plot$is_outlier))] <- as.numeric(NA)
+
+#Label just the combination of lines per point, so that each label can be small.
+
+ridership_2017_to_plot$outlier[is.na(ridership_2017_to_plot$outlier) == FALSE] <- unlist(lapply(strsplit(ridership_2017_to_plot$outlier[is.na(ridership_2017_to_plot$outlier) == FALSE],"/"),"[[",2))
+
+#Manually jitter the coordinates used to plot outliers in cases where they are very close.
+
+ridership_2017_to_plot <- data.frame(ridership_2017_to_plot,Mean.weekly.ridership.jitter = ridership_2017_to_plot$Mean.weekly.ridership,stringsAsFactors=FALSE)
+
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[ridership_2017_to_plot$outlier == "25" & round(ridership_2017_to_plot$is_outlier) == 111640] <- 118600
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[ridership_2017_to_plot$outlier == "123" & round(ridership_2017_to_plot$is_outlier) == 228029] <- 237000
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[ridership_2017_to_plot$outlier == "BD4" & is.na(ridership_2017_to_plot$is_outlier) == FALSE] <- 144000
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[which(ridership_2017_to_plot$outlier == "JMZ" & is.na(ridership_2017_to_plot$is_outlier) == FALSE)[2]] <- 82000
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[which(ridership_2017_to_plot$outlier == "6DF" & is.na(ridership_2017_to_plot$is_outlier) == FALSE)] <- 103000
+ridership_2017_to_plot$Mean.weekly.ridership.jitter[which(ridership_2017_to_plot$outlier == "L" & is.na(ridership_2017_to_plot$is_outlier) == FALSE & round(ridership_2017_to_plot$is_outlier) < 125000)] <- 132000
+
+ggplot(ridership_2017_to_plot,aes(x = Line, y = Mean.weekly.ridership.jitter,fill=Line,colour=Line)) +
+geom_boxplot() +
+ylab("Mean weekly ridership per station") +
+scale_fill_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+ggtitle("2017 ridership per station by line") +
+geom_text(aes(label = outlier),na.rm = TRUE, size=2.5,hjust=0.5,vjust=-1) +
+coord_flip()
+```
+
+What are the outlier stations for each line in 2017?
+
+```{r outliers-per-line, echo=TRUE, eval=TRUE}
+outlier_stations <- ridership_2017_to_plot[is.na(ridership_2017_to_plot$is_outlier) == FALSE,c("Station","Line","Line.Name","Mean.weekly.ridership")]
+outlier_stations[order(outlier_stations$Line,outlier_stations$Mean.weekly.ridership),]
+```
+
+Looking at the boxplot, it appears that the A, J, and Z lines have more stations that are infrequently used compared to others. While the E and 6 have more stations that are frequently used compared to others.
+
+Let's also look at the distribution of how ridership at a given station has changed over time.
+
+Was going to use a nice even 5-year span (2012 to 2017), but Hurricane Sandy in 2012 complicates things.
+
+Let's use 2011 to 2017.
+
+Also remove two stations known to be under construction or closed for a lot of 2011, as these will have high percent change values (Aqueduct Race Track and Cortlandt Street).
+
+```{r year-2017-vs-2011, echo=TRUE, eval=TRUE, fig.height = 7,fig.width = 7,warning=FALSE}
+ridership_2017 <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year == 2017,]
+ridership_2017 <- ridership_2017[which(is.na(ridership_2017$Line) == FALSE),]
+
+ridership_2011 <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year == 2011,]
+ridership_2011 <- ridership_2011[which(is.na(ridership_2011$Line) == FALSE),]
+
+ridership_2011_and_2017 <- rbind(ridership_2011,ridership_2017)
+
+ridership_2011_and_2017 <- ridership_2011_and_2017 %>%
+	select(c("Year","Mean.weekly.ridership","Line","Station","Line.Name")) %>%
+	spread(Year,Mean.weekly.ridership) %>%
+	mutate(Percent.change = (`2017` - `2011`)*100/`2011`)
+
+ridership_2011_and_2017 <- ridership_2011_and_2017[ridership_2011_and_2017$Station != "AQUEDUCT RACE TRACK" & ridership_2011_and_2017$Station != "CORTLANDT STREET",]
+
+ggplot(ridership_2011_and_2017,
+aes(x = Line, y = Percent.change,fill=Line,colour=Line)) +
+geom_boxplot() +
+ylab("Percent change in mean weekly ridership 2011 to 2017") +
+scale_fill_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+coord_flip()
+```
+
+Let's also look at the trends in percent change across lines.
+
+```{r summary-2017-vs-2011, echo=TRUE, eval=TRUE}
+summary(ridership_2011_and_2017$Percent.change)
+```
+
+Overall, more stations than not experienced increases in ridership from 2011 to 2017.
+
+Even fewer stations experienced dramatic decreases (more than 4-5%).
+
+The G and L appear especially notable for the level of increase in ridership they experienced across stations (not just for a few outlier stations) during this time frame.
+
+### Performance trends by line and over time
+
+First, look at the correlation between our two performance metrics (% on time at terminal and in stations) across years.
+
+```{r OTP-and-wait-correlation, echo=TRUE, eval=TRUE,message=FALSE, warning=FALSE}
+#Remove Z line, as stats are duplicated for this and J.
+
+line_vs_OTP_and_wait <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles %>% select(c("Year","Line","OTP","Wait")) %>% filter(Line != "Z")
+line_vs_OTP_and_wait <- data.frame(line_vs_OTP_and_wait,stringsAsFactors=FALSE)
+line_vs_OTP_and_wait <- line_vs_OTP_and_wait[!duplicated(line_vs_OTP_and_wait),]
+
+#Was going to color by year, but then it draws a trend line separate per year. So just plot all years together for now.
+
+#mycol <- c("grey","black","#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+ggplot(line_vs_OTP_and_wait,
+aes(OTP,Wait)) +
+geom_point(size=3) +
+xlab("% on time at terminal") +
+ylab("% on time at stations") +
+geom_smooth(method = "lm")
+```
+
+While they are quite correlated, the correlation is imperfect enough that I think it makes sense to consider them separately.
+
+Next, plot each metric in 2011 vs. 2017.
+
+We draw a line for x=y as well as a linear model so we can get a sense of the trend compared to if the metrics remained constant over time.
+
+```{r OTP-and-wait-scatterplot-2011-vs-2017, echo=TRUE, eval=TRUE}
+line_vs_OTP_and_wait %>%
+select(c("Year","OTP","Line")) %>%
+spread(Year,OTP) %>%
+select(c("2011","2017")) %>%
+ggplot(.,
+aes(`2011`,`2017`)) +
+geom_point(size=3) +
+xlab("% on time at terminal in 2011") +
+ylab("% on time at terminal in 2017") +
+geom_smooth(method = "lm") +
+geom_abline(linetype=2)
+
+line_vs_OTP_and_wait %>% 
+select(c("Year","Wait","Line")) %>%
+spread(Year,Wait) %>%
+select(c("2011","2017")) %>%
+ggplot(.,
+aes(`2011`,`2017`)) +
+geom_point(size=3) +
+xlab("% on time at stations in 2011") +
+ylab("% on time at stations in 2017") +
+geom_smooth(method = "lm") +
+geom_abline(linetype=2)
+```
+
+We find that both performance metrics are lower across the board in 2017 as compared to 2011.
+
+Finally, plot the full trend across time per line.
+
+```{r performance-trends-per-line, echo=TRUE, eval=TRUE,message=FALSE,warning=FALSE}
+ggplot(line_vs_OTP_and_wait,
+aes(x = Year, y = OTP,colour=Line)) +
+geom_line() + geom_point() +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+ylab("% on time at terminal") +
+facet_wrap(~Line)
+
+ggplot(line_vs_OTP_and_wait,
+aes(x = Year, y = Wait, group = Line,colour=Line)) +
+geom_line() + geom_point() +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+ylab("% on time at stations") +
+facet_wrap(~Line)
+```
+
+We find that service generally started to decline around 2013/2014.
+
+### Integrating ridership and performance data
+
+In this section, I will explore the correlation between line changes in performance over time with changes in ridership over time.
+
+Based on the performance trend lines, let's compare 2013 to 2017.
+
+```{r percent-change-performance-and-ridership, echo=TRUE, eval=TRUE}
+line_vs_OTP_and_wait_2013_vs_2017 <- line_vs_OTP_and_wait %>%
+filter(Year == 2013 | Year == 2017)
+
+line_vs_OTP_2013_vs_2017 <- line_vs_OTP_and_wait_2013_vs_2017 %>%
+	select(c("Year","OTP","Line")) %>%
+	spread(Year,OTP) %>%
+	mutate(Percent.change.terminal.ontime = (`2017` - `2013`)*100/2013)
+
+line_vs_wait_2013_vs_2017 <- line_vs_OTP_and_wait_2013_vs_2017 %>%
+	select(c("Year","Wait","Line")) %>%
+	spread(Year,Wait) %>%
+	mutate(Percent.change.stations.ontime = (`2017` - `2013`)*100/2013)
+
+ridership_2017 <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year == 2017,]
+ridership_2017 <- ridership_2017[which(is.na(ridership_2017$Line) == FALSE),]
+
+ridership_2013 <- mean_weekly_ridership_per_year_minus_hubs_and_shuttles[mean_weekly_ridership_per_year_minus_hubs_and_shuttles$Year == 2013,]
+ridership_2013 <- ridership_2013[which(is.na(ridership_2013$Line) == FALSE),]
+
+ridership_2013_and_2017 <- rbind(ridership_2013,ridership_2017)
+
+ridership_2013_and_2017 <- ridership_2013_and_2017 %>%
+        select(c("Year","Mean.weekly.ridership","Line","Station","Line.Name")) %>%
+        spread(Year,Mean.weekly.ridership) %>%
+        mutate(Percent.change.ridership = (`2017` - `2013`)*100/`2013`)
+
+ridership_2013_and_2017 <- merge(ridership_2013_and_2017,line_vs_OTP_2013_vs_2017[,c("Line","Percent.change.terminal.ontime")],by="Line",all=TRUE)
+ridership_2013_and_2017 <- merge(ridership_2013_and_2017,line_vs_wait_2013_vs_2017[,c("Line","Percent.change.stations.ontime")],by="Line",all=TRUE)
+```
+
+Can we model change in ridership as a function of change in either performance metric?
+
+```{r lm-performance-and-ridership, echo=TRUE, eval=TRUE}
+summary(lm(Percent.change.ridership ~ Percent.change.terminal.ontime,data=ridership_2013_and_2017))
+summary(lm(Percent.change.ridership ~ Percent.change.stations.ontime,data=ridership_2013_and_2017))
+```
+
+We find that the coefficient of the model is statistically significant using either metric! However, the model does not explain very much of the variance (very low R-squared).
+
+Let's visualize.
+
+Plot excludes Cortland Street, which had over 200% change in ridership during this time frame.
+
+```{r visualize-change-performance-and-ridership, echo=TRUE, eval=TRUE,message=FALSE,warning=FALSE}
+ggplot(ridership_2013_and_2017,
+aes(Percent.change.terminal.ontime,Percent.change.ridership,colour=Line)) +
+xlab("% change in proportion on time at terminal") +
+ylab("% change in ridership") +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+ggtitle("Percent changes from 2013 to 2017") +
+geom_smooth(aes(group = 1),method="lm") +
+geom_jitter(alpha=1/4) +
+coord_cartesian(ylim=c(-75,75))
+
+ggplot(ridership_2013_and_2017,
+aes(Percent.change.stations.ontime,Percent.change.ridership,colour=Line)) +
+xlab("% change in proportion on time at stations") +
+ylab("% change in ridership") +
+scale_colour_manual(values=c(rep(c("red","forestgreen"),each=3),"violet",rep(c("blue","orange"),times=3),"green","brown","grey","orange",rep("gold",times=3),"brown")) +
+ggtitle("Percent changes from 2013 to 2017") +
+geom_smooth(aes(group = 1),method="lm") +
+geom_jitter(alpha=1/4) +
+coord_cartesian(ylim=c(-75,75))
+```
+
+We confirm visually that the model, while significant, clearly still leaves a lot of the variance unexplained.
+
+### Analysis of sentiment scores from articles about the MTA
+
+#### Distribution of sentiment scores
+
+Make a simple histogram of the sentiment scores.
+
+```{r hist-sentiments, echo=TRUE, eval=TRUE}
+hist(sentiments_per_article,labels=TRUE,
+xlab="Sentiment score (probability of positive sentiment)",
+ylab="Number of articles",
+main="News articles about MTA 02/04/18 to 05/04/18")
+
+print("Proportion of articles with sentiment score > 0.8")
+print(length(which(sentiments_per_article > 0.8))/length(sentiments_per_article))
+print("Proportion of articles with sentiment score > 0.5")
+print(length(which(sentiments_per_article > 0.5))/length(sentiments_per_article))
+```
+
+Sentiments of articles seem generally pretty positive, with around 36% of articles having a high sentiment score and 64% rated as at least more likely than not to be positive.
+
+#### Evaluation of sentiment score accuracy
+
+Does this mean that media coverage of the MTA is actually relatively positive?
+
+Or could this simply be an issue of the Indico algorithm not working so well on this data set?
+
+To fully evaluate the performance of the Indico algorithm here, we would need to manually review all the articles.
+
+This is impractical for a data set of this size with only one reviewer. 
+
+However, we can sample the data and manually review at least a few articles.
+
+Let's sample three articles per sentiment level (say very likely negative, probably negative, probably positive, and very likely positive).
+
+For this we'll define very likely as >90% chance, and probably as >75-90% chance.
+
+Print title, description, and URL for each article.
+
+```{r sample-sentiment-levels, echo=TRUE, eval=TRUE}
+set.seed(1392)
+
+samples_sentiment_levels <- c(sample(which(sentiments_per_article < 0.10),3),
+        sample(which(sentiments_per_article >= 0.10 & sentiments_per_article < 0.25),3),
+	sample(which(sentiments_per_article > 0.75 & sentiments_per_article <= 0.90),3),
+	sample(which(sentiments_per_article > 0.90),3))
+
+data.frame(mta_news_article_info[samples_sentiment_levels,c("title","description","url")],
+Sentiment.score = sentiments_per_article[samples_sentiment_levels],
+stringsAsFactors=FALSE)
+```
+
+The first thing we notice is that the Google News API may have picked up some articles that aren't really related to the MTA (for example, an article about yellow taxis vs. Uber/Lyft, which is transportation-related but not MTA-related).
+
+We also find that a few of the positive articles have enough connection to the MTA that it makes sense that they were tagged, but they are not necessarily directly related to MTA service. Eg a car free day relates to the subway because people took the subway more on those days. Or an article about people moving to Long Island City mentions the good public transportation connections for that neighborhood. 
+
+Some of the articles actually make some sense with their sentiment score if you read them. For example, the article about bar carts no longer being on the LIRR paints a positively nostalgic tone toward the bar carts, even as it is negative toward them being taken away.
+
+#### What factors are correlated with sentiment score?
+
+As we saw from the sample articles, this data set may have inadvertently included some articles that are not directly about the MTA.
+
+One hypothesis for why we are seeing higher sentiment scores than expected is that these other articles are more likely to be positive.
+
+Let's compare sentiment scores for articles with "MTA", "train", or "subway" in their title or description to those without, as I suspect this may filter out some unrelated articles that are bringing up the average.
+
+```{r sentiment-mta-in-title-desc-vs-not, echo=TRUE, eval=TRUE}
+mta_in_title_or_description_scores <- sentiments_per_article[grep('mta|subway|train',paste0(mta_news_article_info$title," ",mta_news_article_info$description),perl=TRUE,ignore.case=TRUE)]
+mta_not_in_title_or_description_scores <- sentiments_per_article[grep('mta|subway|train',paste0(mta_news_article_info$title," ",mta_news_article_info$description),perl=TRUE,ignore.case=TRUE,invert=TRUE)]
+
+print(paste0("Keywords in title or description for ",length(mta_in_title_or_description_scores)," out of ",length(sentiments_per_article)," articles"))
+
+print("Summary of sentiment scores for articles with keywords")
+summary(mta_in_title_or_description_scores)
+
+print("Summary of sentiment scores for articles without keywords")
+summary(mta_not_in_title_or_description_scores)
+
+print("T-test of scores for articles with or without keywords")
+
+t.test(score ~ contains.keyword,
+data.frame(score = c(mta_in_title_or_description_scores,mta_not_in_title_or_description_scores),
+contains.keyword = rep(c("yes","no"),times=c(length(mta_in_title_or_description_scores),length(mta_not_in_title_or_description_scores)))))
+```
+
+It actually appears that sentiment scores are relatively similar whether or not the title or description contain these keywords.
+
+What about source as a covariate?
+
+```{r source-vs-score, echo=TRUE, eval=TRUE}
+stripchart(sentiments_per_article ~ mta_news_article_info$source,method="jitter",pch=21,las=2,xlab="Sentiment score",cex.axis=0.5)
+
+summary_across_sources <- aggregate(sentiments_per_article ~ mta_news_article_info$source,FUN=summary)
+summary_across_sources[summary_across_sources[,1] %in% c("Curbed.com","Nypost.com","Nydailynews.com"),]
+```
+
+Of the three most frequent sources, Curbed.com definitely seems to be the most positive.
+
+Of the other two (NY Daily News and NY Post), it seems like sentiment scores from the NY Post lean more positive. Let's test this using a t-test of scores from the two sources.
+
+```{r t-test-news-vs-post, echo=TRUE, eval=TRUE}
+t_test_results <- t.test(score ~ source,
+data=data.frame(score = sentiments_per_article[mta_news_article_info$source %in% c("Nypost.com","Nydailynews.com")],
+source = mta_news_article_info$source[mta_news_article_info$source %in% c("Nypost.com","Nydailynews.com")]))
+
+print(t_test_results)
+```
+
+We conclude that according to Indico sentiment analysis, articles from the NY Post have significantly higher sentiment scores on average compared to articles from the NY Daily News when it comes to the topic of the MTA. This means that articles tagged with "MTA" are rated as more likely to be positive in tone in one publication over the other.
+
+#### Manual review of sentiment scores from NY Post vs. NY Daily News articles
+
+Let's choose a few more positive articles from each of the two most frequent sources to manually review.
+
+```{r sample-sentiment-levels-2, echo=TRUE, eval=TRUE}
+set.seed(1392)
+
+samples_sentiment_levels <- c(sample(which(sentiments_per_article < 0.10),3),
+        sample(which(sentiments_per_article >= 0.10 & sentiments_per_article < 0.25),3),
+	sample(which(sentiments_per_article > 0.75 & sentiments_per_article <= 0.90),3),
+	sample(which(sentiments_per_article > 0.90),3))
+
+sample_positive_3_from_each_source <- sample(setdiff(which(sentiments_per_article > 0.90 & mta_news_article_info$source == "Nypost.com"),samples_sentiment_levels),3)
+sample_positive_3_from_each_source <- c(sample_positive_3_from_each_source,sample(setdiff(which(sentiments_per_article > 0.90 & mta_news_article_info$source == "Nydailynews.com"),samples_sentiment_levels),3))
+
+data.frame(mta_news_article_info[sample_positive_3_from_each_source,c("title","description","url")],Sentiment.score = sentiments_per_article[sample_positive_3_from_each_source])
+```
+
+Looking in detail at a few more articles, it appears that the Indico algorithm simply does not perform so well on this data set.
+
+The article from the NY Post titled "Powerful nor’easter will make your commute ‘dangerous’" seems like it should certainly be negative, or at the very least neutral.
+
+Another article titled "State legislators near $170B budget deal that includes taxi surcharge" has some positive aspects, but really does not seem overwhelmingly positive enough to warrant a 0.94 sentiment score.
+
+Let's see if we can use the emotion data to figure out what's going on here.
+
+#### Sentiment scores vs. emotion probabilities per article
+
+For each of the five emotions tested (anger, joy, sadness, fear, and surprise), plot their probabilities vs. sentiment score, colored by source.
+
+Let's plot just the two main sources we have (NY Post and NY Daily News) for now, and exclude less frequent sources.
+
+```{r emotions-vs-sentiments, echo=TRUE, eval=TRUE, cache=TRUE}
+emotions_per_article <- data.frame(emotions_per_article,
+	Source = rep(mta_news_article_info$source,each=5),
+	stringsAsFactors=FALSE)
+
+emotions_per_article_post_vs_daily_news  <- emotions_per_article[emotions_per_article$Source == "Nypost.com" | emotions_per_article$Source == "Nydailynews.com",]
+
+ggplot(emotions_per_article_post_vs_daily_news,
+aes(Probability,Sentiment.score.article,colour=Source)) +
+facet_wrap(~Emotion,scales="free_x") +
+geom_point() +
+xlab("Probability of emotion") +
+ylab("Sentiment score of article")
+```
+
+The first thing we notice is that the probabilities for all five emotions are mostly relatively low. Anger and sadness have more points for probability > 0.5 than the other three emotions, but still most points are at < 0.5.
+
+We also notice that the probabilities of each emotion do not seem very correlated with the sentiment scores.
+
+Let's check the actual correlation scores.
+
+```{r correlations-emotions-vs-sentiments, echo=TRUE, eval=TRUE}
+for(emotion in unique(emotions_per_article_post_vs_daily_news$Emotion))
+{
+print(emotion)
+print(cor(emotions_per_article_post_vs_daily_news[emotions_per_article_post_vs_daily_news$Emotion == emotion,"Probability"],
+emotions_per_article_post_vs_daily_news[emotions_per_article_post_vs_daily_news$Emotion == emotion,"Sentiment.score.article"]))
+}
+```
+
+We confirm that the correlations are indeed not very good. 
+
+And strangely enough, the best correlation is very counterintuitive. A higher probability of fear is actually slightly positively correlated with a more positive sentiment score.
+
+Overall, I think these results make some sense. 
+
+Even though news sources of course will often put their own "spin" on things, the low probability scores for the major emotions indicate a relatively neutral emotional tone for a lot of news articles.
+
+Considering the Indico algorithm was trained on movie reviews (which are probably more likely to exhibit the author's emotions on the subject), it is not all that surprising that it might not perform as well on less emotional news articles.
+
+# Conclusions
+
+We confirmed that ridership has generally increased, while performance has generally decreased over time.
+
+Our finding that changes in ridership were correlated with changes in performance was initially promising, but the strength of the correlation is not enough to be practically significant. It is more likely that other factors are the main drivers behind where people work and live, rather than whether the nearest subway line has had more delays over time.
+
+Unfortunately we were unable to get good data on the tone of media reports about the MTA using the tool we tested (Indico sentiment analysis). Our finding that one major NY newspaper tended to have more positive sentiment scores than the other seemed promising at first. But in light of what seems to be questionable performance of Indico on news articles, it is unclear we can conclude much from this finding. A future direction might be to test other algorithms for sentiment analysis and see if they perform better. If one could use a more accurate algorithm to increase confidence in the results, it would be quite interesting to see if different local publications have a different tone toward local issues like this one.
+
+As mentioned earlier, it would be quite interesting to track changes in tone of media reports about the MTA over time. This would be a good idea for a future direction of this work.
+
+# Bonus: Leaflet mapping of a subway line
+
+Let's make a Leaflet map of all subway entrances on the L train.
+
+Coordinates per subway entrance available as a CSV file here:
+
+http://web.mta.info/developers/data/nyct/subway/StationEntrances.csv
+
+```{r leaflet-map, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+library(leaflet)
+
+station_coords <- read.csv("StationEntrances.csv",header=TRUE,check.names=FALSE,stringsAsFactors=FALSE)
+L_train_station_coords <- station_coords %>% filter(Route_1 == "L" | Route_2 == "L" | Route_3 == "L" | Route_4 == "L")
+
+L_train_station_coords %>% leaflet %>% addTiles() %>%
+addAwesomeMarkers(popup=L_train_station_coords$Station_Name,
+icon=makeAwesomeIcon(text="L",squareMarker=TRUE,iconColor="grey"))
+```
+
+Note: For some reason, it defaulted to red when I tried to switch markerColor to grey.
+
+So I decided not to set any markerColor, as the other default of light blue is preferable to a red that is very similar to the color of the 1/2/3 line.
+
+Settings to change the color and shape of the icon worked fine, however. So I made the icon a grey "L".
