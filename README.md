@@ -2,6 +2,6 @@
 
 This repo is a complement to the following Rpubs:
 
-https://rpubs.com/hmgeiger/387627
+http://rpubs.com/hmgeiger/387773
 
 This repo includes the R markdown file used to create the Rpubs, plus R object files for Google News API results and plain text per news article.
